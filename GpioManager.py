@@ -1,9 +1,11 @@
 from contextlib import AbstractContextManager
 import RPi.GPIO as GPIO
 from enum import Enum
-from gpio_monitor import OverflowPolicy
 import janus
 from queue import Full
+import NonBlockQueue
+
+NonBlockQueue
 
 
 class GpioManager(AbstractContextManager):
