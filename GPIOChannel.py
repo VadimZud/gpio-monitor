@@ -2,125 +2,120 @@
 
 import RPi.GPIO as GPIO
 import time
-from threading import Lock, Barrier, Thread
-from contextlib import AbstractContextManager, suppress
+from contextlib import suppress
+from threading import Thread
 
-from NonBlockQueue import NonBlockQueue, KeepNewQueue, KeepOldQueue, Empty
+from NonBlockQueue import KeepNewQueue, Empty
+from tsync import RWLock
 
-__all__ = ['Input', 'Closed']
-
-
-class TCounter:
-    def __init__(self, start=0):
-        self._counter = start
-        self._lock = Lock()
-
-    def increment(self):
-        with self._lock:
-            self._counter += 1
-
-    def decrement(self):
-        with self._lock:
-            self._counter -= 1
-
-    def get(self):
-        with self._lock:
-            return self._counter
+__all__ = ['GPIOInput', 'AlreadyStarted', 'AlreadyStopped']
 
 
-class Closed(Exception):
+class AlreadyStarted(Exception):
     pass
 
 
-class Buffer(AbstractContextManager):
-    TYPE_MAP = {
-        'keep_new': KeepNewQueue,
-        'keep_old': KeepOldQueue,
-    }
-
-    def __init__(self, type, maxsize=0):
-        self._q: NonBlockQueue = self.TYPE_MAP[type](maxsize=maxsize)
-        self._writer_counter = TCounter()
-        self._closed = False
-
-    def close(self):
-        self._closed = True
-
-    def __enter__(self):
-        if self._closed:
-            raise Closed
-
-        self._writer_counter.increment()
-
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self._writer_counter.decrement()
-
-    def get(self):
-        try:
-            return self._q.get()
-        except Empty:
-            if self._closed.get() and self._writer_counter.get() == 0:
-                raise Closed
-            else:
-                raise
-
-    def put(self, item):
-        self._q.put(item)
+class AlreadyStopped(Exception):
+    pass
 
 
-class Input:
+class GPIOInput:
     """Object abstraction for buffered Raspberry Pi GPIO input channel"""
 
-    def __init__(self, channel, buffer_type, buffer_size, pull_up_down=None, edge_type=GPIO.BOTH, bouncetime=None):
+    def __init__(self, channel, edge, buffer_size, pull_up_down=GPIO.PUD_OFF, bouncetime=0):
         self._channel = channel
-        self._buffer_type = buffer_type
+        self._edge = edge
         self._buffer_size = buffer_size
         self._pull_up_down = pull_up_down
-        self._edge_type = edge_type
         self._bouncetime = bouncetime
 
-        self._buffer = Buffer(buffer_type, buffer_size)
-        self._recreate_buffer_lock = Lock()
+        self._buffer = KeepNewQueue(buffer_size)
+        self._buffer_lock = RWLock()
         self._started = False
 
-    def _recreate_buffer(self):
-        with self._recreate_buffer_lock:
-            old_buffer = self._buffer
-            self._buffer = Buffer(self._buffer_type, self._buffer_size)
-            old_buffer.close()
-            barrier = Barrier(2)
+    @property
+    def channel(self):
+        return self._channel
 
-    def _buffer_data_recover(self, old_buffer: Buffer):
-        with old_buffer:
-            old_buffer.close()
+    @property
+    def edge(self):
+        return self._edge
 
-    def event_handler(self, channel):
-        self.buffer.put(time.time())
+    @edge.setter
+    def edge(self, edge):
+        if self._edge != edge:
+            self._edge = edge
+            self.restart()
 
-    def start(self):
-        if not self.started:
-            if self.pull_up_down is None:
-                GPIO.setup(self.channel, GPIO.IN)
-            else:
-                GPIO.setup(self.channel, GPIO.IN,
-                           pull_up_down=self.pull_up_down)
+    @property
+    def buffer_size(self):
+        return self._buffer_size
 
-            if self.bouncetime is None:
-                GPIO.add_event_detect(
-                    self.channel, self.edge_type, callback=self.event_handler)
-            else:
-                GPIO.add_event_detect(
-                    self.channel, self.edge_type, callback=self.event_handler, bouncetime=self.bouncetime)
+    @buffer_size.setter
+    def buffer_size(self, buffer_size):
+        if self._buffer_size != buffer_size:
+            self._buffer_size = buffer_size
+            buffer = KeepNewQueue(buffer_size)
+            Thread(target=self._change_buffer, args=(buffer,)).start()
 
-            self.started = True
+    @property
+    def pull_up_down(self):
+        return self._pull_up_down
+
+    @pull_up_down.setter
+    def pull_up_down(self, pull_up_down):
+        if self._pull_up_down != pull_up_down:
+            self._pull_up_down = pull_up_down
+            self.restart()
+
+    @property
+    def bouncetime(self):
+        return self._bouncetime
+
+    @bouncetime.setter
+    def bouncetime(self, bouncetime):
+        if self._bouncetime != bouncetime:
+            self._bouncetime = bouncetime
+            self.restart()
+
+    def start(self, edge=None, pull_up_down=None, bouncetime=None):
+        if self._started:
+            raise AlreadyStarted
+
+        if edge is not None:
+            self._edge = edge
+
+        if pull_up_down is not None:
+            self._pull_up_down = pull_up_down
+
+        if bouncetime is not None:
+            self._bouncetime = bouncetime
+
+        GPIO.setup(self._channel, GPIO.IN, pull_up_down=self._pull_up_down)
+        GPIO.add_event_detect(
+            self._channel, self._edge, callback=self._event_callback, bouncetime=self._bouncetime)
+        self.started = True
 
     def stop(self):
-        if self.started:
-            GPIO.cleanup(self.channel)
-            self.started = False
+        if not self.started:
+            raise AlreadyStopped
 
-    def restart(self):
-        self.stop()
-        self.start()
+        GPIO.cleanup(self._channel)
+        self.started = False
+
+    def restart(self, *args, **kwargs):
+        if self._started:
+            self.stop()
+            self.start(*args, **kwargs)
+
+    def _event_callback(self, channel):
+        event_time = time.time()
+        with self._buffer_lock.rlock:
+            self._buffer.put(event_time)
+
+    def _change_buffer(self, buffer: KeepNewQueue):
+        with self._buffer_lock.wlock:
+            with suppress(Empty):
+                while True:
+                    buffer.put(self._buffer.get())
+            self._buffer = buffer
