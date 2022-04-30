@@ -16,8 +16,10 @@ class Turnstile:
     def cross(self, *args, **kwargs):
         if not self._lock.acquire(*args, **kwargs):
             return False
-        self._lock.release()
-        return True
+        try:
+            return True
+        finally:
+            self._lock.release()
 
 
 class Switch(AbstractContextManager):
@@ -35,14 +37,27 @@ class Switch(AbstractContextManager):
             if self._counter == 0:
                 if not self._lock.acquire(*args, **kwargs):
                     return False
-            self._counter += 1
-        return True
+            try:
+                self._counter += 1
+                try:
+                    return True
+                except:
+                    self._counter -= 1
+                    raise
+            except:
+                if self._counter == 0:
+                    self._lock.release()
+                raise
 
     def exit(self):
         with self._counter_lock:
             self._counter -= 1
-            if self._counter == 0:
-                self._lock.release()
+            try:
+                if self._counter == 0:
+                    self._lock.release()
+            except:
+                self._counter += 1
+                raise
 
     def __enter__(self):
         self.enter()
@@ -87,16 +102,17 @@ class RWLock:
             start = time()
             if not self._turnstile.lock.acquire(blocking, timeout):
                 return False
-            if timeout > 0:
-                timeout -= (time() - start)
-                if timeout < 0:
-                    self._turnstile.lock.release()
-                    return False
-            return self._switch.lock.acquire(blocking, timeout)
+            try:
+                if timeout > 0:
+                    timeout -= (time() - start)
+                    if timeout < 0:
+                        return False
+                return self._switch.lock.acquire(blocking, timeout)
+            finally:
+                self._turnstile.lock.release()
 
         def release(self):
             self._switch.lock.release()
-            self._turnstile.lock.release()
 
         def __enter__(self):
             self.acquire()

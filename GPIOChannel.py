@@ -1,14 +1,15 @@
 """This module provides object abstraction for buffered Raspberry Pi GPIO channel"""
 
+from typing import AsyncContextManager
 import RPi.GPIO as GPIO
 import time
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from threading import Thread
 
 from NonBlockQueue import KeepNewQueue, Empty
 from tsync import RWLock
 
-__all__ = ['GPIOInput', 'AlreadyStarted', 'AlreadyStopped']
+__all__ = ['GPIOInput', 'AlreadyStarted', 'AlreadyStopped', 'GPIOManager']
 
 
 class AlreadyStarted(Exception):
@@ -30,7 +31,8 @@ class GPIOInput:
         self._bouncetime = bouncetime
 
         self._buffer = KeepNewQueue(buffer_size)
-        self._buffer_lock = RWLock()
+        self._buffer_put_lock = RWLock()
+        self._buffer_get_lock = RWLock()
         self._started = False
 
     @property
@@ -45,7 +47,8 @@ class GPIOInput:
     def edge(self, edge):
         if self._edge != edge:
             self._edge = edge
-            self.restart()
+            if self._started:
+                self.restart()
 
     @property
     def buffer_size(self):
@@ -66,7 +69,8 @@ class GPIOInput:
     def pull_up_down(self, pull_up_down):
         if self._pull_up_down != pull_up_down:
             self._pull_up_down = pull_up_down
-            self.restart()
+            if self._started:
+                self.restart()
 
     @property
     def bouncetime(self):
@@ -76,7 +80,8 @@ class GPIOInput:
     def bouncetime(self, bouncetime):
         if self._bouncetime != bouncetime:
             self._bouncetime = bouncetime
-            self.restart()
+            if self._started:
+                self.restart()
 
     def start(self, edge=None, pull_up_down=None, bouncetime=None):
         if self._started:
@@ -104,18 +109,43 @@ class GPIOInput:
         self.started = False
 
     def restart(self, *args, **kwargs):
-        if self._started:
-            self.stop()
-            self.start(*args, **kwargs)
+        self.stop()
+        self.start(*args, **kwargs)
+
+    def get(self):
+        if not self._buffer_get_lock.rlock.acquire(blocking=False):
+            raise Empty
+        try:
+            return self._buffer.get()
+        finally:
+            self._buffer_get_lock.rlock.release()
 
     def _event_callback(self, channel):
         event_time = time.time()
-        with self._buffer_lock.rlock:
+        with self._buffer_put_lock.rlock:
             self._buffer.put(event_time)
 
     def _change_buffer(self, buffer: KeepNewQueue):
-        with self._buffer_lock.wlock:
+        with self._buffer_put_lock.wlock:
+            with self._buffer_get_lock.wlock:
+                old_buffer = self._buffer
+                self._buffer = buffer
             with suppress(Empty):
                 while True:
-                    buffer.put(self._buffer.get())
-            self._buffer = buffer
+                    self._buffer.put(old_buffer.get())
+
+
+class GPIOManager(AbstractContextManager):
+    def __init__(self, mode):
+        self._mode = mode
+
+    @property
+    def mode(self):
+        return self._mode
+
+    def __enter__(self):
+        GPIO.setmode(self._mode)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        GPIO.clenup()
